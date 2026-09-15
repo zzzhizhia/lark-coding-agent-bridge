@@ -14,6 +14,7 @@ export interface BootstrapProfileInput {
   workspace?: string;
   defaultWorkspace?: string;
   codexBinaryPath?: string;
+  piBinaryPath?: string;
   profileDir?: string;
 }
 
@@ -29,12 +30,16 @@ export async function createBootstrapProfileConfig(
     input.agentKind === 'codex'
       ? await createBootstrapCodexConfig(input.codexBinaryPath)
       : undefined;
+  const pi = input.agentKind === 'pi'
+    ? { binaryPath: await resolveExecutablePath(input.piBinaryPath ?? process.env.LARK_CHANNEL_PI_BIN ?? 'pi') }
+    : undefined;
   const profile = createDefaultProfileConfig({
     agentKind: input.agentKind,
     accounts: input.accounts,
     preferences: input.preferences,
     secrets: input.secrets,
     ...(codex ? { codex } : {}),
+    ...(pi ? { pi } : {}),
   });
   if (workspace) {
     profile.workspaces = {

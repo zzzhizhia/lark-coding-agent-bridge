@@ -1,5 +1,6 @@
 import { ClaudeAdapter } from '../agent/claude/adapter';
 import { CodexAdapter } from '../agent/codex/adapter';
+import { PiAdapter } from '../agent/pi/adapter';
 import { AgentPreflightError, type AgentAvailability } from '../agent/preflight';
 import type { AgentAdapter } from '../agent/types';
 import type { AppPaths } from '../config/app-paths';
@@ -33,6 +34,11 @@ export function createRuntimeAgent(
             : {}),
         }
       : undefined;
+  if (profileConfig.agentKind === 'pi') {
+    const pi = profileConfig.pi;
+    if (!pi?.binaryPath) throw new Error('pi profile requires pi.binaryPath');
+    return new PiAdapter({ binary: pi.binaryPath, larkChannel });
+  }
   if (profileConfig.agentKind === 'codex') {
     const codex = profileConfig.codex;
     if (!codex?.binaryPath) {
@@ -58,9 +64,9 @@ export async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promis
   if (ok) return { ok: true };
   const diagnostic = {
     code: 'agent-binary-not-found' as const,
-    agentId: agent.id === 'codex' ? ('codex' as const) : ('claude' as const),
+    agentId: agent.id === 'codex' ? ('codex' as const) : agent.id === 'pi' ? ('pi' as const) : ('claude' as const),
     agentName: agent.displayName,
-    command: agent.id === 'codex' ? 'codex' : 'claude',
+    command: agent.id === 'codex' ? 'codex' : agent.id === 'pi' ? 'pi' : 'claude',
   };
   return { ok: false, diagnostic, error: new AgentPreflightError(diagnostic) };
 }

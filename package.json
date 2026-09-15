@@ -104,6 +104,8 @@
     "claude",
     "claude-code",
     "codex",
+    "pi",
+    "pi-coding-agent",
     "cli",
     "channel",
     "bridge"

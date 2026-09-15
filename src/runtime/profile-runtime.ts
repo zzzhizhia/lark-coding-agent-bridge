@@ -2,7 +2,7 @@ import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import * as p from '@clack/prompts';
 import { runRegistrationWizard } from '../bot/wizard';
-import { detectInstalledAgents, type DetectedAgent } from '../cli/agent-detection';
+import { detectInstalledAgents, resolveExecutablePath, type DetectedAgent } from '../cli/agent-detection';
 import {
   createBootstrapCodexConfig,
   createBootstrapProfileConfig,
@@ -90,6 +90,9 @@ export function createRuntimeProfileConfig(
     ...(input.agentKind === 'codex'
       ? { codex: input.codex ?? { binaryPath: process.env.LARK_CHANNEL_CODEX_BIN ?? 'codex' } }
       : {}),
+    ...(input.agentKind === 'pi'
+      ? { pi: { binaryPath: process.env.LARK_CHANNEL_PI_BIN ?? 'pi' } }
+      : {}),
   });
 }
 
@@ -108,7 +111,7 @@ export async function resolveProfileRuntime(
   if (!profile && opts.allowBootstrap) {
     const detected = await detectInstalledAgents();
     if (detected.length === 0) {
-      throw new Error('no supported local agent found; install claude or codex first');
+      throw new Error('no supported local agent found; install claude, codex, or pi first');
     }
     if (detected.length > 1) {
       const selected = await selectDetectedAgent(detected, opts.selectAgent);
@@ -137,6 +140,9 @@ export async function resolveProfileRuntime(
     ...(migrationAgent ? { agentKind: migrationAgent } : {}),
     ...(needsMigration && migrationAgent === 'codex'
       ? { codex: await createBootstrapCodexConfig(undefined) }
+      : {}),
+    ...(needsMigration && migrationAgent === 'pi'
+      ? { pi: { binaryPath: await resolveExecutablePath(process.env.LARK_CHANNEL_PI_BIN ?? 'pi') } }
       : {}),
   }, opts.handleActiveBridgeMigrationConflict);
 
@@ -568,7 +574,7 @@ function formatAmbiguousAgentSelectionError(
 ): string {
   const lines = detected.map((agent) => `  - ${agent.kind}: ${agent.binaryPath}`);
   return [
-    '检测到多个本地 agent，请使用 --agent <claude|codex> 指定要初始化哪一个。',
+    '检测到多个本地 agent，请使用 --agent <claude|codex|pi> 指定要初始化哪一个。',
     '已检测到：',
     ...lines,
   ].join('\n');

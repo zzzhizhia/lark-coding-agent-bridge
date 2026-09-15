@@ -13,6 +13,7 @@ import {
   createDefaultProfileConfig,
   type AgentKind,
   type CodexConfig,
+  type PiConfig,
   type RootConfig,
 } from './profile-schema';
 import { markPermissionDefaultsMigration, saveRootConfig } from './profile-store';
@@ -27,6 +28,7 @@ export interface MigrateV2Options {
   workspace?: string;
   agentKind?: AgentKind;
   codex?: CodexConfig;
+  pi?: PiConfig;
 }
 
 export interface MigrateV2Result {
@@ -129,6 +131,7 @@ export async function migrateV1ToV2(opts: MigrateV2Options = {}): Promise<Migrat
       requireMentionInGroup: legacy.preferences?.requireMentionInGroup,
     },
     ...(agentKind === 'codex' && opts.codex ? { codex: opts.codex } : {}),
+    ...(agentKind === 'pi' && opts.pi ? { pi: opts.pi } : {}),
   });
   if (legacyDefaultWorkspace) {
     profileConfig.workspaces = {

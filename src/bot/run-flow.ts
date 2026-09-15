@@ -126,9 +126,12 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     } else if (catalogEntry?.agentId === 'codex') {
       threadId = catalogEntry.threadId;
       resumeFrom = threadId;
+    } else if (catalogEntry?.agentId === 'pi') {
+      sessionId = catalogEntry.sessionId;
+      resumeFrom = sessionId;
     }
   }
-  if (!resumeFrom && input.capability.agentId === 'claude') {
+  if (!resumeFrom && (input.capability.agentId === 'claude' || input.capability.agentId === 'pi')) {
     resumeFrom = input.sessions.resumeFor(input.scopeId, workspace.cwdRealpath);
     sessionId = resumeFrom;
     const stale = input.sessions.getRaw(input.scopeId);
@@ -202,11 +205,14 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
   }
   if (input.capability.agentId === 'codex' && input.event.threadId) {
     input.sessionCatalog?.upsertActive({
-      scopeId: input.scopeId,
-      agentId: 'codex',
-      cwdRealpath: input.policy.cwdRealpath,
-      policyFingerprint: input.policy.policyFingerprint,
-      threadId: input.event.threadId,
+      scopeId: input.scopeId, agentId: 'codex', cwdRealpath: input.policy.cwdRealpath,
+      policyFingerprint: input.policy.policyFingerprint, threadId: input.event.threadId,
+    });
+  }
+  if (input.capability.agentId === 'pi' && input.event.sessionId) {
+    input.sessionCatalog?.upsertActive({
+      scopeId: input.scopeId, agentId: 'pi', cwdRealpath: input.policy.cwdRealpath,
+      policyFingerprint: input.policy.policyFingerprint, sessionId: input.event.sessionId,
     });
   }
 }

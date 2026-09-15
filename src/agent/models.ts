@@ -45,7 +45,7 @@ const CODEX_MODELS: ModelOption[] = [
 
 /** The model picker options for a profile's agent kind. */
 export function supportedModels(agentKind: AgentKind): ModelOption[] {
-  return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+  return agentKind === 'codex' ? CODEX_MODELS : agentKind === 'pi' ? [] : CLAUDE_MODELS;
 }
 
 /** True when the selection means "use the agent default" (no `--model`). */

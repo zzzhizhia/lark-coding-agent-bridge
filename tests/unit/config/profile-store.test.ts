@@ -258,4 +258,30 @@ describe('profile store canonical serialization', () => {
 
     expect(root.migrations?.permissionDefaultsV1).toEqual(['claude']);
   });
+
+  it('persists the pi section across save→load round-trip', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const profile = createDefaultProfileConfig({
+      agentKind: 'pi',
+      accounts: { app },
+      pi: { binaryPath: '/usr/local/bin/pi' },
+    });
+
+    await saveRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'pi',
+      preferences: {},
+      profiles: { pi: profile },
+    }, configPath);
+
+    // On disk: pi section is written (not stripped by the serializer).
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.pi.agentKind).toBe('pi');
+    expect(saved.profiles.pi.pi).toEqual({ binaryPath: '/usr/local/bin/pi' });
+
+    // Reloaded: pi section survives, so the pi profile still validates.
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.profiles.pi?.pi).toEqual({ binaryPath: '/usr/local/bin/pi' });
+  });
 });
