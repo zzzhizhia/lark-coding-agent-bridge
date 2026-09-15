@@ -41,12 +41,26 @@ export class PiJsonTranslator {
           isError: raw.isError === true,
         }];
       }
-      case 'agent_end':
+      case 'agent_end': {
+        // pi retries transient failures (429/5xx, stream drops) internally and
+        // announces the retry with `willRetry: true` before continuing with the
+        // same run. Do not treat that as the end of the run.
+        if (raw.willRetry === true) return [];
         this.terminal = true;
+        // pi ends the run with a normal `agent_end` even when the model request
+        // failed, so the failure has to be read off the last assistant message.
+        const failure = lastAssistantFailure(raw.messages);
+        if (failure) {
+          return [
+            ...(this.assistantText ? [{ type: 'final_text' as const, content: this.assistantText }] : []),
+            { type: 'error', message: failure, terminationReason: 'failed' },
+          ];
+        }
         return [
           ...(this.assistantText ? [{ type: 'final_text' as const, content: this.assistantText }] : []),
           { type: 'done', sessionId: this.sessionId, terminationReason: 'normal' },
         ];
+      }
       case 'error':
         this.terminal = true;
         return [{ type: 'error', message: stringValue(raw.message) ?? 'pi reported an error', terminationReason: 'failed' }];
@@ -103,6 +117,39 @@ function textFromContent(value: unknown): string {
     return stringValue(part.text) ?? stringValue(part.content) ?? '';
   }).join('');
 }
+/**
+ * Returns a human-readable message when the run ended because the model request
+ * failed. `messages` is the `agent_end` payload; the last assistant message is
+ * the one that terminated the run.
+ */
+function lastAssistantFailure(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = recordValue(messages[i]);
+    if (!message || message.role !== 'assistant') continue;
+    if (message.stopReason !== 'error') return undefined;
+    return errorSummary(stringValue(message.errorMessage)) ?? 'pi reported an error';
+  }
+  return undefined;
+}
+
+/**
+ * Provider errors often arrive as an HTML error page (e.g. a CloudFront 503).
+ * Strip the markup, collapse whitespace and keep the card note short.
+ */
+function errorSummary(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const stripped = raw
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const text = stripped || raw.replace(/\s+/g, ' ').trim();
+  if (!text) return undefined;
+  return text.length > 300 ? `${text.slice(0, 299)}…` : text;
+}
+
 function renderResult(value: unknown): string {
   if (typeof value === 'string') return value;
   try { return JSON.stringify(value ?? '') ?? ''; } catch { return String(value); }
