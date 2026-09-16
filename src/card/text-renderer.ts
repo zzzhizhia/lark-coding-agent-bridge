@@ -13,9 +13,22 @@ import { toolHeaderText } from './tool-render';
  *   - Footer is appended inline at the bottom while running
  */
 export function renderText(state: RunState): string {
-  const parts: string[] = [];
+  return renderTextFrom(state, 0);
+}
 
-  for (const block of state.blocks) {
+/**
+ * Render `state` starting at the `fromBlock`-th block — the continuation of a
+ * markdown progress card that was rotated onto a fresh message.
+ *
+ * Block boundaries are the only split points that neither cut a line in half
+ * nor lose content, which is why rotation is expressed in blocks rather than in
+ * characters. See `src/bot/progress-stream.ts`.
+ */
+export function renderTextFrom(state: RunState, fromBlock: number): string {
+  const parts: string[] = [];
+  const blocks = fromBlock > 0 ? state.blocks.slice(fromBlock) : state.blocks;
+
+  for (const block of blocks) {
     const piece = renderBlock(block);
     if (piece) parts.push(piece);
   }

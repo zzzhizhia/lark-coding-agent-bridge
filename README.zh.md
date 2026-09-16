@@ -9,7 +9,7 @@
 ## 主要功能
 
 - 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code / Codex CLI。
-- **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。
+- **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。飞书在开启流式更新 10 分钟后就不再接受卡片更新，所以更长的任务会自动续到下一条卡片，回复的尾部（包括最终答案）不会跟着卡片一起丢掉。
 - **COT 过程消息**：可选先发一条过程消息展示 agent 的阶段性文本和工具调用，再单独发送最终答案。
 - **会话延续**：每个聊天、话题或文档评论有自己的会话，不会互相串。
 - **排队与消息合并**：短时间连续发送的消息会合并处理；任务运行中收到的普通消息会排队到下一轮，`/new`、`/cd`、`/ws use`、`/stop` 这类命令可以中断当前任务。
@@ -234,7 +234,7 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `~/.lark-channel/registry/processes.json` | 本机进程注册表 |
 | `~/.lark-channel/registry/locks/` | profile lock 和 app lock |
 
-设置 `LARK_CHANNEL_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARK_CHANNEL_LOG_DAYS` 可以调整日志保留天数。
+设置 `LARK_CHANNEL_HOME=/path/to/state` 可以迁移整棵本地状态目录。`LARK_CHANNEL_LOG_DAYS` 可以调整日志保留天数。`LARK_CHANNEL_STREAM_LEASE_MS`（默认 `600000`）和 `LARK_CHANNEL_STREAM_ROTATE_MS`（默认租期的 80%，设为 `0` 关闭）控制 markdown 进度卡片何时续到下一条消息。
 
 ## 访问控制
 

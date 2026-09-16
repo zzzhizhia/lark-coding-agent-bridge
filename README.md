@@ -9,7 +9,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 ## What it does
 
 - Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
-- **Streaming card**: text replies and tool calls update on one Lark card in real time.
+- **Streaming card**: text replies and tool calls update on one Lark card in real time. Feishu stops accepting card updates 10 minutes after it enabled streaming, so a longer run continues on a fresh card — the tail of the reply, answer included, is never dropped with the card.
 - **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.
 - **Session continuity**: each chat, topic, or document comment thread keeps its own session.
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
@@ -236,7 +236,7 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 | `~/.lark-channel/registry/processes.json` | Local process registry |
 | `~/.lark-channel/registry/locks/` | Profile and app locks |
 
-Set `LARK_CHANNEL_HOME=/path/to/state` to move all local bridge state. `LARK_CHANNEL_LOG_DAYS` overrides log retention.
+Set `LARK_CHANNEL_HOME=/path/to/state` to move all local bridge state. `LARK_CHANNEL_LOG_DAYS` overrides log retention. `LARK_CHANNEL_STREAM_LEASE_MS` (default `600000`) and `LARK_CHANNEL_STREAM_ROTATE_MS` (default 80% of the lease, `0` disables) tune when a markdown progress card is continued on a new message.
 
 ## Access control
 

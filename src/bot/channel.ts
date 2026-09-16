@@ -58,6 +58,12 @@ import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
+import {
+  createLazyProgressStream,
+  createMarkdownProgressStream,
+  type LazyProgressStream,
+  type MarkdownProgressStream,
+} from './progress-stream';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -77,6 +83,14 @@ import {
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
+
+/**
+ * Posted ahead of the answer when it never reached a live progress card — the
+ * card above stopped updating, so the reply it was carrying has to go out as
+ * its own message. The notice is what makes a partial repeat self-explanatory.
+ */
+const STREAM_LOST_NOTICE =
+  '⚠️ 上方卡片的流式更新已停止(飞书流式卡片最长 10 分钟),以下是完整回复:';
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
@@ -1193,23 +1207,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
-      let producerStarted = false;
-      let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
-      const progress = createLazyProgressStream(scope, replyMode, () =>
-        channel.stream(
-          chatId,
-          {
-            markdown: async (ctrl) => {
-              producerStarted = true;
-              if (progress.abandoned()) return;
-              markdownCtrl = ctrl;
-              await ctrl.setContent(renderText(filterForPrefs(latestState)));
-              await renderDone;
-            },
-          },
-          sendOpts,
-        ),
-      );
+      let postedOutsideStream = false;
+      const progress = createMarkdownProgressStream({
+        scope,
+        state: () => filterForPrefs(latestState),
+        open: (producer) => channel.stream(chatId, { markdown: producer }, sendOpts),
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -1219,28 +1222,44 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async (state) => {
           latestState = state;
           if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
-          if (markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
-          }
+          // Rotation lives in here: a card stops accepting updates ten minutes
+          // after Feishu enabled its streaming mode, so a longer run continues
+          // on a fresh one instead of freezing where it stood.
+          await progress.push();
+        },
+      ).then(
+        (state) => {
+          progress.finish();
+          return state;
+        },
+        (err: unknown) => {
+          progress.finish();
+          throw err;
         },
       );
+      let streamError: unknown;
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
           progress,
           renderDone,
-          producerStarted: () => producerStarted,
+          producerStarted: () => progress.producerStarted(),
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
             const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
-            }
+            if (!body.trim()) return;
+            await channel.send(chatId, { markdown: body }, sendOpts);
+            postedOutsideStream = true;
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
-        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+        if (controls.profileConfig.agentKind === 'codex') {
+          log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+        } else {
+          // A failed stream no longer swallows the answer: it goes out below,
+          // and the error is rethrown once it has.
+          streamError = err;
+        }
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
@@ -1253,6 +1272,19 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
           cardRenderOptions,
         });
+      } else {
+        await deliverUnstreamedAnswer({
+          channel,
+          chatId,
+          scope,
+          state: filterForPrefs(latestState),
+          progress,
+          postedOutsideStream,
+          replyMode,
+          sendOpts,
+          cardRenderOptions,
+        });
+        if (streamError) throw streamError;
       }
     } else {
       // text mode: drain the agent stream without sending anything during
@@ -1285,62 +1317,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
-}
-
-interface LazyProgressStream {
-  /**
-   * Mirrors the underlying `channel.stream(...)` promise, and stays pending
-   * forever while no stream has been opened — so callers can race it against
-   * the render loop exactly as if the stream had been created up front.
-   */
-  readonly settled: Promise<unknown>;
-  opened(): boolean;
-  ensureOpen(): void;
-  /**
-   * True once the reply went out without this stream. A producer that starts
-   * after that must render nothing, or the user gets the same answer twice.
-   */
-  abandoned(): boolean;
-  abandon(): void;
-}
-
-/**
- * Wrap a progress stream so the user-visible message is only created once the
- * run has something worth showing (see `shouldOpenProgressStream`).
- *
- * The SDK starts a stream eagerly: `channel.stream(...)` sends a card before
- * the producer runs, and finishes it with a "(no content)" placeholder when the
- * producer never supplied any text. A Codex round that only produces a final
- * answer (delivered separately by `sendFinalReply`) used to hit exactly that:
- * an empty card sat in the chat for seconds until `recall-empty` cleaned it up.
- */
-function createLazyProgressStream(
-  scope: string,
-  mode: 'card' | 'markdown',
-  open: () => Promise<unknown>,
-): LazyProgressStream {
-  let stream: Promise<unknown> | undefined;
-  let givenUp = false;
-  let settle!: (result: Promise<unknown>) => void;
-  const settled = new Promise<unknown>((resolve, reject) => {
-    settle = (result) => {
-      result.then(resolve, reject);
-    };
-  });
-  return {
-    settled,
-    opened: () => stream !== undefined,
-    ensureOpen: () => {
-      if (stream) return;
-      log.info('outbound', 'progress-stream-open', { scope, mode });
-      stream = open();
-      settle(stream);
-    },
-    abandoned: () => givenUp,
-    abandon: () => {
-      givenUp = true;
-    },
-  };
 }
 
 /**
@@ -1436,6 +1412,58 @@ async function recallStreamedMessage(
       err: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/**
+ * Feishu drops the updates sent to a card whose streaming mode already expired,
+ * and it does so without raising anything: the card freezes where it stood and
+ * the answer riding on it never arrives. Nothing in the logs says so either,
+ * which is what makes it look like a hung run.
+ *
+ * The only signal left is a comparison: what the user has to receive versus
+ * what live cards were actually told to show. When the answer is missing from
+ * every one of them, post it as its own message. A partial repeat is cosmetic;
+ * a silently dropped answer is the bug.
+ */
+async function deliverUnstreamedAnswer(input: {
+  channel: LarkChannel;
+  chatId: string;
+  scope: string;
+  state: RunState;
+  progress: MarkdownProgressStream;
+  /** Set when the answer already went out on a non-stream path. */
+  postedOutsideStream: boolean;
+  replyMode: ReturnType<typeof getMessageReplyMode>;
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  cardRenderOptions: { signCallback?: (action: string) => string };
+}): Promise<void> {
+  if (!input.progress.opened()) return;
+  if (input.progress.abandoned() || input.postedOutsideStream) return;
+
+  const answerState = finalAnswerOnlyState(input.state);
+  const answer = renderText(answerState).trim();
+  if (!answer || input.progress.trustedShows(answer)) return;
+
+  log.warn('outbound', 'answer-not-streamed', {
+    scope: input.scope,
+    mode: input.replyMode,
+    rotations: input.progress.rotations(),
+  });
+  await sendFinalReply({
+    channel: input.channel,
+    chatId: input.chatId,
+    scope: input.scope,
+    state: {
+      ...answerState,
+      blocks: [
+        { kind: 'text', content: STREAM_LOST_NOTICE, streaming: false },
+        ...answerState.blocks,
+      ],
+    },
+    replyMode: input.replyMode,
+    sendOpts: input.sendOpts,
+    cardRenderOptions: input.cardRenderOptions,
+  });
 }
 
 async function sendFinalReply(input: {
