@@ -131,6 +131,29 @@ describe('markdown progress stream lease', () => {
     expect(lastMarkdown(channel)).toContain('流式更新已停止');
   });
 
+  it('delivers the ending when the card missed the terminal frame', async () => {
+    // A card that froze before the terminal frame leaves the user watching a run
+    // that already ended. How it ended is part of what has to arrive.
+    vi.stubEnv('LARK_CHANNEL_STREAM_LEASE_MS', '300');
+    vi.stubEnv('LARK_CHANNEL_STREAM_ROTATE_MS', '0');
+    const { cards, stream } = recordingStream();
+    const channel = (await startTestBridge(
+      new PacedAgent([
+        { type: 'text', delta: 'PROGRESS_ONE' },
+        400,
+        { type: 'error', message: 'model exploded', terminationReason: 'failed' },
+      ]),
+      stream,
+    ));
+
+    await channel.handlers.message?.(message('om_late_failure', 'run'));
+
+    await waitFor(() => channel.sent.length === 1);
+    expect(cards).toHaveLength(1);
+    expect(lastMarkdown(channel)).toContain('agent 失败');
+    expect(lastMarkdown(channel)).toContain('model exploded');
+  });
+
   it('leaves a healthy short run alone', async () => {
     vi.stubEnv('LARK_CHANNEL_STREAM_LEASE_MS', '600');
     vi.stubEnv('LARK_CHANNEL_STREAM_ROTATE_MS', '300');
