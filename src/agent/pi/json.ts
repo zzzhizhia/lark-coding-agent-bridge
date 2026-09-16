@@ -19,7 +19,12 @@ export class PiJsonTranslator {
         return this.translateAssistantUpdate(recordValue(raw.assistantMessageEvent));
       case 'message_end': {
         const message = recordValue(raw.message);
-        const content = message ? textFromContent(message.content) : '';
+        // pi reports every message of the turn over the same channel, the user's
+        // prompt included. Only the assistant's own text is an answer: seeding
+        // `assistantText` from the prompt made `final_text` start with the
+        // bridge's system prompt (and the user's message) followed by the reply.
+        if (!message || message.role !== 'assistant') return [];
+        const content = textFromContent(message.content);
         if (content && !this.assistantText) this.assistantText = content;
         return [];
       }

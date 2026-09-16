@@ -78,6 +78,33 @@ describe('markdown progress stream lease', () => {
     expect(channel.sent).toHaveLength(0);
   });
 
+  it('ignores an adapter whose final text repeats the prompt it was given', async () => {
+    // pi reports the user's prompt over its own event stream. A bridge that
+    // trusted `final_text` verbatim would read "system prompt + answer" as the
+    // answer, never find it on the card, and post the prompt back at the user.
+    vi.stubEnv('LARK_CHANNEL_STREAM_LEASE_MS', '600');
+    vi.stubEnv('LARK_CHANNEL_STREAM_ROTATE_MS', '300');
+    const { cards, stream } = recordingStream();
+    const channel = (await startTestBridge(
+      new PacedAgent([
+        { type: 'text', delta: 'ANSWER_SENTINEL' },
+        {
+          type: 'final_text',
+          content: 'BRIDGE_SYSTEM_PROMPT\n\n<user_input>run</user_input>\n\nANSWER_SENTINEL',
+        },
+        { type: 'done', terminationReason: 'normal' },
+      ]),
+      stream,
+    ));
+
+    await channel.handlers.message?.(message('om_prompt_echo', 'run'));
+
+    await waitFor(() => lastText(cards).includes('ANSWER_SENTINEL'));
+    await settle();
+    expect(cards).toHaveLength(1);
+    expect(channel.sent).toHaveLength(0);
+  });
+
   it('posts the answer on its own when Feishu dropped it', async () => {
     // Rotation off: the only card ages out, Feishu keeps accepting the updates
     // and drops them, and nothing throws. The answer never reached the screen,

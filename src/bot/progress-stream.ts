@@ -106,8 +106,13 @@ export interface MarkdownProgressStream extends LazyProgressStream {
   push(): Promise<void>;
   /** Seal the live card: the run is over, so nothing else will be pushed. */
   finish(): void;
-  /** True once `answer` reached a card that was still inside its lease. */
-  trustedShows(answer: string): boolean;
+  /**
+   * True once every one of `parts` reached a card that was still inside its
+   * lease. Callers pass one part per rendered block: a reply can span several
+   * cards (rotation never splits a block), so the check has to be per block
+   * rather than on the concatenation, which no single card ever held.
+   */
+  trustedShowsAll(parts: readonly string[]): boolean;
   /** How many continuation cards were opened after the first one. */
   rotations(): number;
   /** True once the SDK ran a producer, i.e. a card is really being written. */
@@ -249,12 +254,16 @@ export function createMarkdownProgressStream(deps: {
   };
 
   const rotate = async (previous: Session): Promise<void> => {
+    // Claim the next ordinal before opening: what the new card records must not
+    // land in the slot of the card it replaced, or the text the old card showed
+    // is forgotten and the answer looks undelivered.
+    rotations += 1;
     const next = openSession(continuationBlock(previous));
     seal(next);
     log.info('outbound', 'progress-stream-rotate', {
       scope: deps.scope,
       mode: 'markdown',
-      rotation: next.ordinal + 1,
+      rotation: next.ordinal,
       startBlock: next.startBlock,
       ageMs: now() - previous.openedAt,
       leaseMs,
@@ -263,7 +272,6 @@ export function createMarkdownProgressStream(deps: {
     // message (and turns its streaming mode off) once the producer returns.
     previous.release();
     await previous.sealed.catch(() => undefined);
-    rotations = next.ordinal + 1;
   };
 
   return {
@@ -280,10 +288,11 @@ export function createMarkdownProgressStream(deps: {
       finished = true;
       session?.release();
     },
-    trustedShows: (answer: string) => {
-      const needle = answer.trim();
-      return needle !== '' && liveTexts.some((text) => text.includes(needle));
-    },
+    trustedShowsAll: (parts: readonly string[]) =>
+      parts.every((part) => {
+        const needle = part.trim();
+        return needle !== '' && liveTexts.some((text) => text.includes(needle));
+      }),
     ensureOpen: () => {
       if (session) return;
       log.info('outbound', 'progress-stream-open', { scope: deps.scope, mode: 'markdown' });

@@ -25,6 +25,68 @@ describe('Pi JSON translator', () => {
     ).toEqual([{ type: 'text', delta: 'hi' }]);
   });
 
+  it('does not take the user prompt as the answer', () => {
+    const t = new PiJsonTranslator();
+    t.translate({ type: 'session', id: 'sess-1' });
+
+    // pi reports the user's prompt over the same stream it reports the answer on
+    // (`message_start` / `message_end` carry the role). Seeding the answer from
+    // it turned `final_text` into the bridge's own system prompt followed by the
+    // reply — which is exactly what got posted back at the user.
+    const prompt = 'BRIDGE_SYSTEM_PROMPT\n\n<user_input>hi</user_input>';
+    t.translate({ type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: prompt }] } });
+    t.translate({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: prompt }] } });
+    t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'the answer' } });
+
+    expect(
+      t.translate({
+        type: 'agent_end',
+        willRetry: false,
+        messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'the answer' }] }],
+      }),
+    ).toEqual([
+      { type: 'final_text', content: 'the answer' },
+      { type: 'done', sessionId: 'sess-1', terminationReason: 'normal' },
+    ]);
+  });
+
+  it('seeds the answer from an assistant message that never streamed deltas', () => {
+    const t = new PiJsonTranslator();
+
+    t.translate({
+      type: 'message_end',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'whole answer at once' }] },
+    });
+
+    expect(
+      t.translate({
+        type: 'agent_end',
+        willRetry: false,
+        messages: [{ role: 'assistant', stopReason: 'stop', content: [] }],
+      }),
+    ).toEqual([
+      { type: 'final_text', content: 'whole answer at once' },
+      { type: 'done', sessionId: undefined, terminationReason: 'normal' },
+    ]);
+  });
+
+  it('ignores tool results reported over the message channel', () => {
+    const t = new PiJsonTranslator();
+
+    t.translate({
+      type: 'message_end',
+      message: { role: 'toolResult', toolCallId: 't1', content: [{ type: 'text', text: 'file contents' }] },
+    });
+
+    expect(
+      t.translate({
+        type: 'agent_end',
+        willRetry: false,
+        messages: [{ role: 'assistant', stopReason: 'stop', content: [] }],
+      }),
+    ).toEqual([{ type: 'done', sessionId: undefined, terminationReason: 'normal' }]);
+  });
+
   it('completes normally when the run ends without an error', () => {
     const t = new PiJsonTranslator();
     t.translate({ type: 'session', id: 'sess-1' });

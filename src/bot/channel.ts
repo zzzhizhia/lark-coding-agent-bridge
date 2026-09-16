@@ -25,6 +25,7 @@ import {
   markIdleTimeout,
   markInterrupted,
   reduce,
+  type Block,
   type RunState,
 } from '../card/run-state';
 import { renderText } from '../card/text-renderer';
@@ -1415,6 +1416,50 @@ async function recallStreamedMessage(
 }
 
 /**
+ * The blocks the user has to be able to read once the run is over: the answer a
+ * progress card renders. `finalText` is the adapter's own retelling of the same
+ * words and is used only when there are no text blocks at all — an adapter that
+ * holds its answer back until the end.
+ *
+ * Checking blocks rather than `finalText` keeps this honest to what the card was
+ * showing: an adapter whose `final_text` also carries the prompt it was given
+ * would otherwise look like an answer that never arrived.
+ */
+function answerBlocks(state: RunState): Block[] {
+  const textBlocks = state.blocks.filter((block) => block.kind === 'text');
+  return textBlocks.length > 0 ? textBlocks : finalAnswerOnlyState(state).blocks;
+}
+
+/**
+ * One rendered string per answer block. Blocks — never characters — are what
+ * rotation splits on, so a reply that spans cards is still verified whole, per
+ * unit, instead of as a concatenation no single card ever held.
+ */
+function answerParts(state: RunState): string[] {
+  const scaffold: RunState = {
+    ...state,
+    reasoning: { content: '', active: false },
+    footer: null,
+    terminal: 'done',
+    errorMsg: undefined,
+  };
+  const parts = answerBlocks(state)
+    .map((block) => renderText({ ...scaffold, blocks: [block] }).trim())
+    .filter((part) => part !== '');
+  // How the run ended is part of the ending the user has to be able to read:
+  // a card that froze before the terminal frame leaves them watching a run that
+  // already failed or was stopped.
+  const notice = renderText({
+    ...scaffold,
+    blocks: [],
+    terminal: state.terminal,
+    errorMsg: state.errorMsg,
+  }).trim();
+  if (notice !== '') parts.push(notice);
+  return parts;
+}
+
+/**
  * Feishu drops the updates sent to a card whose streaming mode already expired,
  * and it does so without raising anything: the card freezes where it stood and
  * the answer riding on it never arrives. Nothing in the logs says so either,
@@ -1440,9 +1485,9 @@ async function deliverUnstreamedAnswer(input: {
   if (!input.progress.opened()) return;
   if (input.progress.abandoned() || input.postedOutsideStream) return;
 
-  const answerState = finalAnswerOnlyState(input.state);
-  const answer = renderText(answerState).trim();
-  if (!answer || input.progress.trustedShows(answer)) return;
+  const parts = answerParts(input.state);
+  if (parts.length === 0) return;
+  if (input.progress.trustedShowsAll(parts)) return;
 
   log.warn('outbound', 'answer-not-streamed', {
     scope: input.scope,
@@ -1454,11 +1499,13 @@ async function deliverUnstreamedAnswer(input: {
     chatId: input.chatId,
     scope: input.scope,
     state: {
-      ...answerState,
+      ...input.state,
       blocks: [
         { kind: 'text', content: STREAM_LOST_NOTICE, streaming: false },
-        ...answerState.blocks,
+        ...answerBlocks(input.state),
       ],
+      reasoning: { content: '', active: false },
+      footer: null,
     },
     replyMode: input.replyMode,
     sendOpts: input.sendOpts,

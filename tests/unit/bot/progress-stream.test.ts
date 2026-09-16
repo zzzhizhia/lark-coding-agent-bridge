@@ -68,7 +68,7 @@ describe('createMarkdownProgressStream', () => {
 
     expect(progress.opened()).toBe(true);
     expect(streams.cards[0]?.texts[0]).toContain('hello');
-    expect(progress.trustedShows('hello')).toBe(true);
+    expect(progress.trustedShowsAll(['hello'])).toBe(true);
 
     progress.finish();
     await expect(progress.settled).resolves.toEqual({ messageId: 'om_1' });
@@ -151,8 +151,8 @@ describe('createMarkdownProgressStream', () => {
     // The update is still attempted — Feishu accepts it and drops it — so the
     // only honest answer to "did the user see it?" is no.
     expect(streams.cards[0]?.texts.at(-1)).toContain('ANSWER');
-    expect(progress.trustedShows('ANSWER')).toBe(false);
-    expect(progress.trustedShows('progress')).toBe(true);
+    expect(progress.trustedShowsAll(['ANSWER'])).toBe(false);
+    expect(progress.trustedShowsAll(['progress'])).toBe(true);
   });
 
   it('does not count an update the API rejected', async () => {
@@ -183,8 +183,8 @@ describe('createMarkdownProgressStream', () => {
     current = state([textBlock('progress'), textBlock('ANSWER')]);
     await expect(progress.push()).rejects.toThrow('rate limited');
 
-    expect(progress.trustedShows('progress')).toBe(true);
-    expect(progress.trustedShows('ANSWER')).toBe(false);
+    expect(progress.trustedShowsAll(['progress'])).toBe(true);
+    expect(progress.trustedShowsAll(['ANSWER'])).toBe(false);
   });
 
   it('seals the live card when the run gives up on the stream', async () => {
@@ -207,6 +207,32 @@ describe('createMarkdownProgressStream', () => {
     expect(progress.abandoned()).toBe(true);
     expect(streams.cards).toHaveLength(1);
     await expect(progress.settled).resolves.toEqual({ messageId: 'om_1' });
+  });
+
+  it('treats a reply spread over rotated cards as shown when every block landed', async () => {
+    const streams = createFakeStreams();
+    const clock = createClock();
+    let current = state([textBlock('first half')]);
+    const progress = createMarkdownProgressStream({
+      scope: 'oc_dm',
+      state: () => current,
+      open: streams.open,
+      now: clock.now,
+      leaseMs: 1000,
+      rotateAfterMs: 800,
+    });
+
+    progress.ensureOpen();
+    await tick();
+
+    current = state([textBlock('first half'), textBlock('second half')]);
+    clock.advance(900);
+    await progress.push();
+
+    // The reply lives on two cards now; no single card ever held the whole
+    // thing, so the check has to be per block — and must hold either way.
+    expect(progress.trustedShowsAll(['first half', 'second half'])).toBe(true);
+    expect(progress.trustedShowsAll(['first half', 'and more'])).toBe(false);
   });
 
   it('reads its bounds from the environment so a long lease can be exercised', () => {
