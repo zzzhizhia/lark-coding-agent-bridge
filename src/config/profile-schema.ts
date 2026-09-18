@@ -113,6 +113,28 @@ export interface MeetingConfig {
   summaryTarget: MeetingSummaryTarget;
 }
 
+/**
+ * Push-driven local automation for generated notes. Feishu pushes
+ * `vc.note.generated_v1` (user-scoped, `vc:note:read`) on the long connection
+ * the bridge already owns; the bridge then runs a local command — e.g. a sync
+ * script that copies 「我的笔记」 docs into Apple Notes — instead of the script
+ * polling the drive on a timer. Off by default.
+ *
+ * The note document may still be generating when the push arrives, so the
+ * command is run once after {@link NotesSyncConfig.delayMs} and re-run after
+ * each entry in {@link NotesSyncConfig.retryDelaysMs}. The command itself is
+ * expected to be idempotent (skip docs it has already imported).
+ */
+export interface NotesSyncConfig {
+  enabled: boolean;
+  /** argv of the local command; an empty array disables the hook. */
+  command: string[];
+  /** Delay before the first run after the push (ms). */
+  delayMs: number;
+  /** Extra runs scheduled after the first, to catch still-generating content. */
+  retryDelaysMs: number[];
+}
+
 export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
 
 /**
@@ -169,6 +191,8 @@ export interface ProfileConfig {
   comments: CommentConfig;
   /** In-meeting agent settings. See {@link MeetingConfig}. */
   meeting: MeetingConfig;
+  /** Generated-note push automation. See {@link NotesSyncConfig}. */
+  notesSync: NotesSyncConfig;
   larkCli: LarkCliConfig;
 }
 
@@ -249,6 +273,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     attachments?: Partial<AttachmentConfig>;
     comments?: unknown;
     meeting?: unknown;
+    notesSync?: unknown;
     larkCli?: unknown;
   };
 
@@ -279,6 +304,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
   const workspaces = normalizeWorkspaces(raw.workspaces);
   const comments = normalizeComments(raw.comments);
   const meeting = normalizeMeeting(raw.meeting);
+  const notesSync = normalizeNotesSync(raw.notesSync);
   const larkCli = normalizeLarkCli(raw.larkCli);
 
   return {
@@ -305,6 +331,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     },
     comments,
     meeting,
+    notesSync,
     larkCli,
   };
 }
@@ -454,6 +481,39 @@ function normalizeMeeting(input: unknown): MeetingConfig {
       raw.summaryTarget === 'owner' || raw.summaryTarget === 'origin'
         ? raw.summaryTarget
         : MEETING_DEFAULTS.summaryTarget,
+  };
+}
+
+export const NOTES_SYNC_DEFAULTS: NotesSyncConfig = {
+  enabled: false,
+  command: [],
+  delayMs: 15_000,
+  retryDelaysMs: [120_000],
+};
+
+/** Longest delay accepted for either the first run or a retry: 10 minutes. */
+const NOTES_SYNC_MAX_DELAY_MS = 600_000;
+
+function normalizeNotesSync(input: unknown): NotesSyncConfig {
+  const raw = (input && typeof input === 'object' ? input : {}) as {
+    enabled?: unknown;
+    command?: unknown;
+    delayMs?: unknown;
+    retryDelaysMs?: unknown;
+  };
+  const retryDelaysMs = Array.isArray(raw.retryDelaysMs)
+    ? raw.retryDelaysMs
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0)
+        .map((v) => Math.min(Math.floor(v), NOTES_SYNC_MAX_DELAY_MS))
+        .slice(0, 5)
+    : [...NOTES_SYNC_DEFAULTS.retryDelaysMs];
+  return {
+    enabled: raw.enabled === true,
+    // Trim and drop blanks so a half-written config never yields an argv whose
+    // first element is whitespace.
+    command: stringArray(raw.command).map((s) => s.trim()).filter(Boolean),
+    delayMs: clampNumber(raw.delayMs, 0, NOTES_SYNC_MAX_DELAY_MS, NOTES_SYNC_DEFAULTS.delayMs),
+    retryDelaysMs,
   };
 }
 

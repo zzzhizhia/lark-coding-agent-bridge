@@ -573,4 +573,51 @@ describe('profile schema', () => {
       maxAccess: 'workspace',
     });
   });
+
+  it('defaults notes sync off with no command', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+    });
+
+    expect(cfg.notesSync).toEqual({
+      enabled: false,
+      command: [],
+      delayMs: 15_000,
+      retryDelaysMs: [120_000],
+    });
+  });
+
+  it('normalizes notes sync: trims the command, drops blanks, bounds delays and retries', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      notesSync: {
+        enabled: true,
+        command: ['  /opt/homebrew/bin/python3 ', '', '  ', '/tmp/sync.py'],
+        delayMs: -5,
+        retryDelaysMs: ['nope', -3, 1200.9, 999_999_999, 0],
+      },
+    });
+
+    expect(cfg.notesSync).toEqual({
+      enabled: true,
+      command: ['/opt/homebrew/bin/python3', '/tmp/sync.py'],
+      delayMs: 0,
+      retryDelaysMs: [1200, 600_000, 0],
+    });
+  });
+
+  it('keeps an explicitly empty retry list instead of restoring the default', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      notesSync: { enabled: true, command: ['/bin/true'], retryDelaysMs: [] },
+    });
+
+    expect(cfg.notesSync.retryDelaysMs).toEqual([]);
+  });
 });

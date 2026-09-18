@@ -61,6 +61,7 @@ type StoredProfileConfig = Pick<
   | 'attachments'
   | 'comments'
   | 'meeting'
+  | 'notesSync'
   | 'larkCli'
 >;
 
@@ -101,6 +102,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     attachments: profile.attachments,
     comments: {},
     meeting: profile.meeting,
+    notesSync: profile.notesSync,
     larkCli: profile.larkCli,
   };
 }

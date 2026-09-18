@@ -248,6 +248,39 @@ describe('profile store canonical serialization', () => {
     });
   });
 
+  it('persists generated-note sync settings across save→load round-trip', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const profile = createDefaultProfileConfig({ agentKind: 'claude', accounts: { app } });
+    // Defaults keep the hook off until a profile configures a command.
+    expect(profile.notesSync.enabled).toBe(false);
+    profile.notesSync = {
+      ...profile.notesSync,
+      enabled: true,
+      command: ['/opt/homebrew/bin/python3', '/tmp/sync.py'],
+      delayMs: 20_000,
+      retryDelaysMs: [60_000, 300_000],
+    };
+
+    await saveRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'claude',
+      preferences: {},
+      profiles: { claude: profile },
+    }, configPath);
+
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.claude.notesSync).toMatchObject({ enabled: true });
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.profiles.claude?.notesSync).toMatchObject({
+      enabled: true,
+      command: ['/opt/homebrew/bin/python3', '/tmp/sync.py'],
+      delayMs: 20_000,
+      retryDelaysMs: [60_000, 300_000],
+    });
+  });
+
   it('marks newly created roots as already evaluated for permission default migration', () => {
     const profile = createDefaultProfileConfig({
       agentKind: 'claude',
