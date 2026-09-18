@@ -3,13 +3,30 @@ import { log } from '../core/logger';
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
 
 /**
- * Feishu's "note generated" push (`vc.note.generated_v1`). User-scoped
- * (`vc:note:read`, user auth): once the console subscribes the event, the
- * platform delivers it on the long connection the bridge already owns, for the
- * user who authorized the app. The body carries `note_token`, so the bridge can
- * react in seconds instead of polling the drive.
+ * Feishu's "note generated" push (`vc.note.generated_v1`), user-scoped
+ * (`vc:note:read`, user auth).
+ *
+ * The console checkbox alone does not create a user-identity subscription — the
+ * user has to subscribe through the API (`POST /open-apis/vc/v1/notes/subscription`)
+ * before the platform pushes anything. The payload carries `note_token`.
  */
 export const NOTES_GENERATED_EVENT = 'vc.note.generated_v1';
+
+/**
+ * Feishu's "minute generated" push (`minutes.minute.generated_v1`), also
+ * user-scoped, subscribed through `POST /open-apis/minutes/v1/minutes/subscription`.
+ *
+ * A 妙记 is generated alongside its 「我的笔记」 document — one second before it in
+ * the recording flow we measured — and it is the event this app actually
+ * receives today, while the note push stays silent. The hook therefore treats
+ * both as triggers: the command lists the drive and skips what it already
+ * imported, so an extra trigger costs one listing and can only make the sync
+ * earlier.
+ */
+export const MINUTES_GENERATED_EVENT = 'minutes.minute.generated_v1';
+
+/** Every push that means "a note may exist now". */
+const TRIGGER_EVENTS = [NOTES_GENERATED_EVENT, MINUTES_GENERATED_EVENT] as const;
 
 /**
  * The slice of `LarkChannel` we subscribe through — same structural probe as
@@ -24,7 +41,7 @@ interface RawEventSource {
 }
 
 export interface NotesSyncHealth {
-  /** Whether the `vc.note.generated_v1` subscription was installed. */
+  /** Whether the push subscriptions were installed. */
   hooked: boolean;
   /** Why it could not be installed (disabled / no command / old SDK). */
   reason?: string;
@@ -137,11 +154,11 @@ export class NotesSyncHook {
       return this.healthState();
     }
     try {
-      this.unsubscribers.push(
-        channel.onRawEvent(NOTES_GENERATED_EVENT, (data) => this.handle(data)),
-      );
+      for (const eventType of TRIGGER_EVENTS) {
+        this.unsubscribers.push(channel.onRawEvent(eventType, (data) => this.handle(data)));
+      }
       this.health = { ...this.health, hooked: true };
-      log.info('notes', 'sync-hooked', {});
+      log.info('notes', 'sync-hooked', { events: [...TRIGGER_EVENTS] });
     } catch (err) {
       this.detach();
       this.health = { hooked: false, reason: `注册事件失败：${String(err)}`, received: 0, runs: 0 };

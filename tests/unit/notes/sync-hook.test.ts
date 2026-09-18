@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NOTES_SYNC_DEFAULTS, type NotesSyncConfig } from '../../../src/config/profile-schema';
 import { spawnProcess } from '../../../src/platform/spawn';
 import {
+  MINUTES_GENERATED_EVENT,
   NOTES_GENERATED_EVENT,
   NotesSyncHook,
   spawnNotesCommand,
@@ -70,7 +71,7 @@ describe('NotesSyncHook attach', () => {
     const health = hook({ channel }).hook.attach();
 
     expect(health.hooked).toBe(true);
-    expect([...handlers.keys()]).toEqual([NOTES_GENERATED_EVENT]);
+    expect([...handlers.keys()]).toEqual([NOTES_GENERATED_EVENT, MINUTES_GENERATED_EVENT]);
   });
 
   it('degrades with a reason (not a throw) when onRawEvent is unavailable', () => {
@@ -97,7 +98,7 @@ describe('NotesSyncHook attach', () => {
     const { channel, handlers } = fakeChannel();
     const { hook: h, run } = hook({ channel });
     h.attach();
-    expect(handlers.size).toBe(1);
+    expect(handlers.size).toBe(2);
 
     handlers.get(NOTES_GENERATED_EVENT)?.({ event_id: 'e1', note_token: 't1' });
     h.dispose();
@@ -132,6 +133,22 @@ describe('NotesSyncHook runs', () => {
 
     expect(h.healthState()).toMatchObject({ received: 1, runs: 3 });
     expect(h.healthState().lastRunAt).toBeTruthy();
+  });
+
+  it('treats the minute-generated push as a trigger too', () => {
+    // A 妙记 lands about a second before its 「我的笔记」 document and is the event
+    // this app reliably receives; the command lists the drive itself, so either
+    // push may start it.
+    vi.useFakeTimers();
+    const { channel, handlers } = fakeChannel();
+    const { hook: h, run } = hook({ channel });
+    h.attach();
+
+    handlers.get(MINUTES_GENERATED_EVENT)?.({ event_id: 'm1', minute_token: 'min-1' });
+    vi.advanceTimersByTime(1000);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(h.healthState().received).toBe(1);
   });
 
   it('counts a push and schedules nothing when disabled at fire time', () => {
