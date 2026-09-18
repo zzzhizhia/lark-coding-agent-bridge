@@ -141,7 +141,9 @@ describe('ClaudeAdapter process contract', () => {
     });
 
     expect(await collect(run.events)).toEqual([
-      { type: 'text', delta: 'before failure' },
+      // The assistant text is the answer: held back, then handed over when the
+      // process ends without a `result` event of its own.
+      { type: 'final_text', content: 'before failure' },
       {
         type: 'error',
         message: 'claude exited with code 42: boom',

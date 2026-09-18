@@ -3,7 +3,15 @@ import type { AgentEvent } from '../types';
 export class PiJsonTranslator {
   private sessionId: string | undefined;
   private terminal = false;
-  private assistantText = '';
+  /**
+   * Text of the message pi is writing right now, held back instead of streamed.
+   *
+   * The last message of a turn is the answer, and the answer goes out as its own
+   * message (see `deliverFinalAnswer` in bot/channel) rather than trailing the
+   * process card. Text that turns out to be commentary is released as soon as the
+   * run moves on — a tool call, or another message starting.
+   */
+  private pendingText = '';
   private readonly tools = new Set<string>();
 
   translate(raw: unknown): AgentEvent[] {
@@ -15,6 +23,11 @@ export class PiJsonTranslator {
         this.sessionId = id;
         return [{ type: 'system', sessionId: id, cwd: stringValue(raw.cwd) }];
       }
+      case 'message_start': {
+        // Another assistant message means the previous one was not the answer.
+        const message = recordValue(raw.message);
+        return message?.role === 'assistant' ? this.releasePendingText() : [];
+      }
       case 'message_update':
         return this.translateAssistantUpdate(recordValue(raw.assistantMessageEvent));
       case 'message_end': {
@@ -25,7 +38,7 @@ export class PiJsonTranslator {
         // bridge's system prompt (and the user's message) followed by the reply.
         if (!message || message.role !== 'assistant') return [];
         const content = textFromContent(message.content);
-        if (content && !this.assistantText) this.assistantText = content;
+        if (content && !this.pendingText) this.pendingText = content;
         return [];
       }
       case 'tool_execution_start': {
@@ -33,7 +46,11 @@ export class PiJsonTranslator {
         const name = stringValue(raw.toolName);
         if (!id || !name) return [];
         this.tools.add(id);
-        return [{ type: 'tool_use', id, name, input: raw.args ?? {} }];
+        // Text followed by a tool call is commentary, not the answer.
+        return [
+          ...this.releasePendingText(),
+          { type: 'tool_use', id, name, input: raw.args ?? {} },
+        ];
       }
       case 'tool_execution_end': {
         const id = stringValue(raw.toolCallId);
@@ -52,17 +69,18 @@ export class PiJsonTranslator {
         // same run. Do not treat that as the end of the run.
         if (raw.willRetry === true) return [];
         this.terminal = true;
+        const answer = this.takePendingText();
         // pi ends the run with a normal `agent_end` even when the model request
         // failed, so the failure has to be read off the last assistant message.
         const failure = lastAssistantFailure(raw.messages);
         if (failure) {
           return [
-            ...(this.assistantText ? [{ type: 'final_text' as const, content: this.assistantText }] : []),
+            ...(answer ? [{ type: 'final_text' as const, content: answer }] : []),
             { type: 'error', message: failure, terminationReason: 'failed' },
           ];
         }
         return [
-          ...(this.assistantText ? [{ type: 'final_text' as const, content: this.assistantText }] : []),
+          ...(answer ? [{ type: 'final_text' as const, content: answer }] : []),
           { type: 'done', sessionId: this.sessionId, terminationReason: 'normal' },
         ];
       }
@@ -81,9 +99,14 @@ export class PiJsonTranslator {
   finish(reason: 'failed' | 'interrupted' | 'timeout' = 'failed'): AgentEvent[] {
     if (this.terminal) return [];
     this.terminal = true;
-    return reason === 'failed'
-      ? [{ type: 'error', message: 'pi stream ended before agent_end', terminationReason: 'failed' }]
-      : [{ type: 'done', sessionId: this.sessionId, terminationReason: reason }];
+    const answer = this.takePendingText();
+    const terminal: AgentEvent = reason === 'failed'
+      ? { type: 'error', message: 'pi stream ended before agent_end', terminationReason: 'failed' }
+      : { type: 'done', sessionId: this.sessionId, terminationReason: reason };
+    return [
+      ...(answer ? [{ type: 'final_text' as const, content: answer }] : []),
+      terminal,
+    ];
   }
 
   fail(message: string): AgentEvent[] {
@@ -97,11 +120,27 @@ export class PiJsonTranslator {
     const delta = stringValue(event.delta ?? event.content);
     if (!delta) return [];
     if (event.type === 'text_delta') {
-      this.assistantText += delta;
-      return [{ type: 'text', delta }];
+      this.pendingText += delta;
+      return [];
+    }
+    if (event.type === 'text_end') {
+      if (!this.pendingText) this.pendingText = delta;
+      return [];
     }
     if (event.type === 'thinking_delta') return [{ type: 'thinking', delta }];
     return [];
+  }
+
+  /** Hand the held text to the progress card as commentary. */
+  private releasePendingText(): AgentEvent[] {
+    const text = this.takePendingText();
+    return text ? [{ type: 'text', delta: text }] : [];
+  }
+
+  private takePendingText(): string {
+    const text = this.pendingText;
+    this.pendingText = '';
+    return text;
   }
 }
 

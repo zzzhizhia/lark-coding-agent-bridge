@@ -3,13 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter.js';
-import { translateEvent } from '../../../src/agent/claude/stream-json.js';
+import { ClaudeStreamTranslator } from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
 
 describe('Claude stream-json translator', () => {
   it('translates system init metadata', () => {
     expect([
-      ...translateEvent({
+      ...new ClaudeStreamTranslator().translate({
         type: 'system',
         subtype: 'init',
         session_id: 'sess-1',
@@ -19,12 +19,12 @@ describe('Claude stream-json translator', () => {
     ]).toEqual([
       { type: 'system', sessionId: 'sess-1', cwd: '/repo', model: 'sonnet' },
     ]);
-    expect([...translateEvent({ type: 'system', subtype: 'init', session_id: 'sess-1' })][0]).not.toHaveProperty('threadId');
+    expect([...new ClaudeStreamTranslator().translate({ type: 'system', subtype: 'init', session_id: 'sess-1' })][0]).not.toHaveProperty('threadId');
   });
 
   it('translates assistant text, thinking, and tool_use blocks in order', () => {
     expect([
-      ...translateEvent({
+      ...new ClaudeStreamTranslator().translate({
         type: 'assistant',
         message: {
           content: [
@@ -43,7 +43,7 @@ describe('Claude stream-json translator', () => {
 
   it('translates user tool_result blocks including structured output and errors', () => {
     expect([
-      ...translateEvent({
+      ...new ClaudeStreamTranslator().translate({
         type: 'user',
         message: {
           content: [
@@ -70,7 +70,7 @@ describe('Claude stream-json translator', () => {
 
   it('translates result usage before done', () => {
     expect([
-      ...translateEvent({
+      ...new ClaudeStreamTranslator().translate({
         type: 'result',
         session_id: 'sess-2',
         usage: { input_tokens: 12, output_tokens: 34, cache_read_input_tokens: 5 },
@@ -80,14 +80,50 @@ describe('Claude stream-json translator', () => {
       { type: 'usage', inputTokens: 12, outputTokens: 34, cachedInputTokens: 5, costUsd: 0.1234 },
       { type: 'done', sessionId: 'sess-2', terminationReason: 'normal' },
     ]);
-    expect([...translateEvent({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');
+    expect([...new ClaudeStreamTranslator().translate({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');
+  });
+
+  it('holds the answer back until the turn ends', () => {
+    const t = new ClaudeStreamTranslator();
+    expect(
+      t.translate({ type: 'assistant', message: { content: [{ type: 'text', text: 'the answer' }] } }),
+    ).toEqual([]);
+    expect(t.translate({ type: 'result', session_id: 'sess-3' })).toEqual([
+      { type: 'final_text', content: 'the answer' },
+      { type: 'done', sessionId: 'sess-3', terminationReason: 'normal' },
+    ]);
+  });
+
+  it('releases text as commentary when the message calls a tool', () => {
+    const t = new ClaudeStreamTranslator();
+    expect(
+      t.translate({
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'text', text: 'checking' },
+            { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+          ],
+        },
+      }),
+    ).toEqual([
+      { type: 'text', delta: 'checking' },
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+    ]);
+  });
+
+  it('turns the held text into the answer when the process dies without a result', () => {
+    const t = new ClaudeStreamTranslator();
+    t.translate({ type: 'assistant', message: { content: [{ type: 'text', text: 'partial' }] } });
+    expect(t.finish()).toEqual([{ type: 'final_text', content: 'partial' }]);
+    expect(t.finish()).toEqual([]);
   });
 
   it('ignores unknown, empty, and incomplete raw events', () => {
-    expect([...translateEvent(null)]).toEqual([]);
-    expect([...translateEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } })]).toEqual([]);
-    expect([...translateEvent({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't' }] } })]).toEqual([]);
-    expect([...translateEvent({ type: 'system', subtype: 'other' })]).toEqual([]);
+    expect([...new ClaudeStreamTranslator().translate(null)]).toEqual([]);
+    expect([...new ClaudeStreamTranslator().translate({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } })]).toEqual([]);
+    expect([...new ClaudeStreamTranslator().translate({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't' }] } })]).toEqual([]);
+    expect([...new ClaudeStreamTranslator().translate({ type: 'system', subtype: 'other' })]).toEqual([]);
   });
 });
 
@@ -115,7 +151,9 @@ describe('Claude stream-json reader behavior', () => {
     const events = await collect(run.events);
 
     expect(events).toEqual([
-      { type: 'text', delta: 'kept' },
+      // The assistant text is held back as the answer, and still survives a
+      // process that dies before its `result` event.
+      { type: 'final_text', content: 'kept' },
       {
         type: 'error',
         message: `claude exited with code 7: ${stderr}`,

@@ -20,9 +20,11 @@ describe('Pi JSON translator', () => {
     expect(t.translate({ type: 'tool_execution_end', toolCallId: 't1', result: { ok: true }, isError: false })).toEqual([
       { type: 'tool_result', id: 't1', output: '{"ok":true}', isError: false },
     ]);
+    // Streamed text is held: the last message of a turn is the answer, and the
+    // answer is delivered as its own message rather than as the card's tail.
     expect(
       t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hi' } }),
-    ).toEqual([{ type: 'text', delta: 'hi' }]);
+    ).toEqual([]);
   });
 
   it('does not take the user prompt as the answer', () => {
@@ -103,6 +105,67 @@ describe('Pi JSON translator', () => {
       { type: 'done', sessionId: 'sess-1', terminationReason: 'normal' },
     ]);
     expect(t.terminalEmitted()).toBe(true);
+  });
+
+  it('holds the answer back until the turn ends', () => {
+    const t = new PiJsonTranslator();
+    t.translate({ type: 'session', id: 'sess-1' });
+
+    expect(
+      t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'the ' } }),
+    ).toEqual([]);
+    expect(
+      t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } }),
+    ).toEqual([]);
+    expect(
+      t.translate({
+        type: 'agent_end',
+        willRetry: false,
+        messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'the answer' }] }],
+      }),
+    ).toEqual([
+      { type: 'final_text', content: 'the answer' },
+      { type: 'done', sessionId: 'sess-1', terminationReason: 'normal' },
+    ]);
+  });
+
+  it('releases text as commentary once a tool call follows', () => {
+    const t = new PiJsonTranslator();
+    t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'let me check' } });
+
+    expect(
+      t.translate({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'ls' } }),
+    ).toEqual([
+      { type: 'text', delta: 'let me check' },
+      { type: 'tool_use', id: 't1', name: 'bash', input: { command: 'ls' } },
+    ]);
+
+    // Commentary stays commentary: the turn ends without an answer of its own.
+    t.translate({ type: 'tool_execution_end', toolCallId: 't1', result: 'ok', isError: false });
+    expect(
+      t.translate({
+        type: 'agent_end',
+        willRetry: false,
+        messages: [{ role: 'assistant', stopReason: 'stop', content: [] }],
+      }),
+    ).toEqual([{ type: 'done', sessionId: undefined, terminationReason: 'normal' }]);
+  });
+
+  it('hands the previous message over as commentary when another one starts', () => {
+    const t = new PiJsonTranslator();
+    t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'first' } });
+
+    expect(t.translate({ type: 'message_start', message: { role: 'assistant', content: [] } })).toEqual([
+      { type: 'text', delta: 'first' },
+    ]);
+
+    t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'second' } });
+    expect(
+      t.translate({ type: 'agent_end', willRetry: false, messages: [] }),
+    ).toEqual([
+      { type: 'final_text', content: 'second' },
+      { type: 'done', sessionId: undefined, terminationReason: 'normal' },
+    ]);
   });
 
   it('reports a failure when the last assistant message ended with stopReason=error', () => {
@@ -220,7 +283,7 @@ describe('Pi JSON translator', () => {
     // The retry keeps streaming into the same run.
     expect(
       t.translate({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'recovered' } }),
-    ).toEqual([{ type: 'text', delta: 'recovered' }]);
+    ).toEqual([]);
     expect(
       t.translate({
         type: 'agent_end',

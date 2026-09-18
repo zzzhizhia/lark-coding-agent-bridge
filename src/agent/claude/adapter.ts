@@ -16,7 +16,7 @@ import {
   type AgentRun,
   type AgentRunOptions,
 } from '../types';
-import { translateEvent } from './stream-json';
+import { ClaudeStreamTranslator } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
@@ -204,6 +204,8 @@ async function* createEventStream(
   }
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  // One translator per run: it holds the answer back until the turn ends.
+  const translator = new ClaudeStreamTranslator();
   let sawStdout = false;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
   const closeSilentStdout = (): void => {
@@ -223,7 +225,7 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      yield* translator.translate(parsed);
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);
@@ -233,6 +235,7 @@ async function* createEventStream(
 
   const earlyRuntimeError = getError();
   if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
+    yield* translator.finish();
     yield {
       type: 'error',
       message: `claude runtime error: ${earlyRuntimeError.message}`,
@@ -256,12 +259,14 @@ async function* createEventStream(
   if (exitCode !== 0 && exitCode !== null) {
     const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
     const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
+    yield* translator.finish();
     yield {
       type: 'error',
       message: `claude exited with code ${exitCode}${detail}`,
       terminationReason: 'failed',
     };
   } else if (runtimeError) {
+    yield* translator.finish();
     yield {
       type: 'error',
       message: `claude runtime error: ${runtimeError.message}`,

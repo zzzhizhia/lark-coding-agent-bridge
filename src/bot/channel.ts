@@ -47,7 +47,9 @@ import {
   toPromptAttachment,
 } from '../media/attachment';
 import { canUseDm, canUseGroup, requireMentionForChat } from '../policy/access';
+import { buildLarkChannelEnv } from '../agent/lark-channel-env';
 import { MeetingManager } from '../meeting/manager';
+import { NotesSyncHook } from '../notes/sync-hook';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
 import type { ScopeContext } from '../policy/run-policy';
@@ -193,7 +195,19 @@ export interface StartChannelDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   controls: Controls;
-  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
+  /**
+   * Callers pass the full {@link AppPaths}; the picks here are what this
+   * function reads: secrets/keystore for credential resolution, media for
+   * callback nonces, and the root/profile/lark-cli dirs used to build the
+   * bridge-bound environment for spawned sync commands.
+   */
+  appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'> &
+    Partial<
+      Pick<
+        AppPaths,
+        'profile' | 'rootDir' | 'configFile' | 'larkCliConfigDir' | 'larkCliSourceConfigFile'
+      >
+    >;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
@@ -480,6 +494,35 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     controls.meeting = meetingManager;
   }
 
+  // Generated-note push automation. The hook rides the existing event
+  // connection and runs a configured local command; off unless the profile
+  // opts in. Attached before connect() so the dispatcher entry exists before
+  // any push can arrive — same reason as the meeting handlers above.
+  let notesSyncHook: NotesSyncHook | undefined;
+  if (controls.profileConfig.notesSync.enabled) {
+    const paths = deps.appPaths;
+    notesSyncHook = new NotesSyncHook({
+      channel,
+      config: () => controls.profileConfig.notesSync,
+      // The daemon's own env carries only LARK_CHANNEL_HOME; rebuild the full
+      // bridge-bound set so a lark-cli-based sync script stays on this profile.
+      ...(paths
+        ? {
+            env: buildLarkChannelEnv({
+              ...(paths.profile ? { profile: paths.profile } : {}),
+              ...(paths.rootDir ? { rootDir: paths.rootDir } : {}),
+              ...(paths.configFile ? { configPath: paths.configFile } : {}),
+              ...(paths.larkCliConfigDir ? { larkCliConfigDir: paths.larkCliConfigDir } : {}),
+              ...(paths.larkCliSourceConfigFile
+                ? { larkCliSourceConfigFile: paths.larkCliSourceConfigFile }
+                : {}),
+            }),
+          }
+        : {}),
+    });
+    notesSyncHook.attach();
+  }
+
   await channel.connect();
   const ownerRefresh = createOwnerRefreshController({
     controls,
@@ -533,6 +576,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       // reconnect would be surprising.
       meetingManager?.dispose();
       controls.meeting = undefined;
+      notesSyncHook?.dispose();
       pending.cancelAll();
       const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
@@ -1139,6 +1183,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let postedOutsideStream = false;
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
@@ -1181,31 +1226,35 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           renderDone,
           producerStarted: () => producerStarted,
           fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
+            const body = renderText(filterForPrefs(state));
+            if (!body.trim()) return;
             await channel.send(
               chatId,
               { card: renderCard(filterForPrefs(state), cardRenderOptions) },
               sendOpts,
             );
+            postedOutsideStream = !heldBackAnswer(filterForPrefs(state));
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
+        // The run is over either way: log the failure, then still deliver the
+        // answer below — it is no longer hostage to the stream.
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-      }
+      await deliverFinalAnswer({
+        channel,
+        chatId,
+        scope,
+        state: filterForPrefs(latestState),
+        // Card mode patches a plain message, so a card that opened is showing
+        // whatever it was given — there is no lease to distrust here.
+        answerVisible: () => progress.opened() && !progress.abandoned(),
+        postedOutsideStream,
+        replyMode,
+        sendOpts,
+        cardRenderOptions,
+      });
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let postedOutsideStream = false;
@@ -1238,7 +1287,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           throw err;
         },
       );
-      let streamError: unknown;
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
@@ -1246,47 +1294,32 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           renderDone,
           producerStarted: () => progress.producerStarted(),
           fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
             const body = renderText(filterForPrefs(state));
             if (!body.trim()) return;
             await channel.send(chatId, { markdown: body }, sendOpts);
-            postedOutsideStream = true;
+            postedOutsideStream = !heldBackAnswer(filterForPrefs(state));
           },
         });
       } catch (err) {
-        if (controls.profileConfig.agentKind === 'codex') {
-          log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
-        } else {
-          // A failed stream no longer swallows the answer: it goes out below,
-          // and the error is rethrown once it has.
-          streamError = err;
-        }
+        // The run is over either way: log the failure, then still deliver the
+        // answer below — it is no longer hostage to the stream.
+        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-      } else {
-        await deliverUnstreamedAnswer({
-          channel,
-          chatId,
-          scope,
-          state: filterForPrefs(latestState),
-          progress,
-          postedOutsideStream,
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
-        if (streamError) throw streamError;
-      }
+      await deliverFinalAnswer({
+        channel,
+        chatId,
+        scope,
+        state: filterForPrefs(latestState),
+        // Only a card still inside its lease, and actually told to show the
+        // answer, counts as having delivered it.
+        answerVisible: (parts) =>
+          progress.opened() && !progress.abandoned() && progress.trustedShowsAll(parts),
+        postedOutsideStream,
+        replyMode,
+        sendOpts,
+        cardRenderOptions,
+      });
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1303,10 +1336,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         channel,
         chatId,
         scope,
-        state:
-          controls.profileConfig.agentKind === 'codex'
-            ? finalAnswerOnlyState(filterForPrefs(finalState))
-            : filterForPrefs(finalState),
+        // Text mode posts one message: the process view with the answer appended.
+        state: withHeldAnswer(filterForPrefs(finalState)),
         replyMode,
         sendOpts,
         cardRenderOptions,
@@ -1338,32 +1369,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 function shouldOpenProgressStream(state: RunState): boolean {
   if (state.terminal !== 'running') return false;
   return renderText({ ...state, footer: null }).trim() !== '';
-}
-
-/**
- * What Codex's dedicated final reply may carry, given what the progress stream
- * already put on screen.
- *
- * `finalAnswerOnlyState` falls back to the run's text blocks when Codex held
- * nothing back for the end — correct where nothing was streamed (CoT, text
- * mode, a stream we gave up on), but those blocks are already visible once a
- * stream rendered them, and repeating them posts the same words a second time.
- * Codex leaves the answer in `blocks` more often than it looks: any abnormal
- * turn end (`turn.failed`, or the process exiting before `turn.completed`)
- * flushes the pending message as text instead of `final_text`.
- *
- * Terminal notices are dropped for the same reason — the stream rendered them.
- */
-function finalReplyState(progress: LazyProgressStream, state: RunState): RunState {
-  if (!progress.opened() || progress.abandoned()) return finalAnswerOnlyState(state);
-  return {
-    ...state,
-    blocks: state.finalText ? [{ kind: 'text', content: state.finalText, streaming: false }] : [],
-    reasoning: { content: '', active: false },
-    footer: null,
-    terminal: 'done',
-    errorMsg: undefined,
-  };
 }
 
 /**
@@ -1416,18 +1421,43 @@ async function recallStreamedMessage(
 }
 
 /**
- * The blocks the user has to be able to read once the run is over: the answer a
- * progress card renders. `finalText` is the adapter's own retelling of the same
- * words and is used only when there are no text blocks at all — an adapter that
- * holds its answer back until the end.
+ * Did the adapter keep its answer out of the process stream?
  *
- * Checking blocks rather than `finalText` keeps this honest to what the card was
- * showing: an adapter whose `final_text` also carries the prompt it was given
- * would otherwise look like an answer that never arrived.
+ * codex, pi and claude report the turn's final message as `final_text` instead
+ * of streaming it, so the process card never shows it. Text blocks that already
+ * carry the same words mean the answer was streamed as commentary, and then the
+ * card is where the user reads it.
+ */
+function heldBackAnswer(state: RunState): boolean {
+  const answer = state.finalText?.trim();
+  if (!answer) return false;
+  return !state.blocks.some(
+    (block) => block.kind === 'text' && block.content.includes(answer),
+  );
+}
+
+/**
+ * The blocks the user has to be able to read once the run is over: the answer —
+ * held back by the adapter, or the text a card streamed.
  */
 function answerBlocks(state: RunState): Block[] {
+  if (heldBackAnswer(state)) {
+    return [{ kind: 'text', content: state.finalText as string, streaming: false }];
+  }
   const textBlocks = state.blocks.filter((block) => block.kind === 'text');
   return textBlocks.length > 0 ? textBlocks : finalAnswerOnlyState(state).blocks;
+}
+
+/** Text mode is a single message: the process view with the answer appended. */
+function withHeldAnswer(state: RunState): RunState {
+  if (!heldBackAnswer(state)) return state;
+  return {
+    ...state,
+    blocks: [
+      ...state.blocks,
+      { kind: 'text', content: state.finalText as string, streaming: false },
+    ],
+  };
 }
 
 /**
@@ -1460,40 +1490,45 @@ function answerParts(state: RunState): string[] {
 }
 
 /**
- * Feishu drops the updates sent to a card whose streaming mode already expired,
- * and it does so without raising anything: the card freezes where it stood and
- * the answer riding on it never arrives. Nothing in the logs says so either,
- * which is what makes it look like a hung run.
+ * The answer goes out as its own message.
  *
- * The only signal left is a comparison: what the user has to receive versus
- * what live cards were actually told to show. When the answer is missing from
- * every one of them, post it as its own message. A partial repeat is cosmetic;
- * a silently dropped answer is the bug.
+ * It is not the tail of a progress card: a card is a process view (commentary,
+ * tool calls) that can rotate, freeze or be recalled, and what it shows is a
+ * side effect of that. Whether the answer still has to be sent is decided on
+ * evidence — a card inside its lease that was told to show it, or a fallback
+ * reply that carried it, means it is already in front of the user.
+ *
+ * An adapter that holds its answer back never put it on a card, so nothing there
+ * can prove it arrived and it always goes out here. For an answer that *was*
+ * riding on a card, Feishu drops updates past the streaming lease without saying
+ * so: it is not late, it never arrives — hence the notice in front of it.
  */
-async function deliverUnstreamedAnswer(input: {
+async function deliverFinalAnswer(input: {
   channel: LarkChannel;
   chatId: string;
   scope: string;
   state: RunState;
-  progress: MarkdownProgressStream;
-  /** Set when the answer already went out on a non-stream path. */
+  /** Whether the run's cards already put the answer in front of the user. */
+  answerVisible: (parts: readonly string[]) => boolean;
+  /** Set when a fallback reply already carried the answer. */
   postedOutsideStream: boolean;
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
 }): Promise<void> {
-  if (!input.progress.opened()) return;
-  if (input.progress.abandoned() || input.postedOutsideStream) return;
-
+  if (input.postedOutsideStream) return;
   const parts = answerParts(input.state);
   if (parts.length === 0) return;
-  if (input.progress.trustedShowsAll(parts)) return;
 
-  log.warn('outbound', 'answer-not-streamed', {
-    scope: input.scope,
-    mode: input.replyMode,
-    rotations: input.progress.rotations(),
-  });
+  const heldBack = heldBackAnswer(input.state);
+  if (!heldBack && input.answerVisible(parts)) return;
+  if (!heldBack) {
+    log.warn('outbound', 'answer-not-streamed', {
+      scope: input.scope,
+      mode: input.replyMode,
+    });
+  }
+
   await sendFinalReply({
     channel: input.channel,
     chatId: input.chatId,
@@ -1501,7 +1536,9 @@ async function deliverUnstreamedAnswer(input: {
     state: {
       ...input.state,
       blocks: [
-        { kind: 'text', content: STREAM_LOST_NOTICE, streaming: false },
+        ...(heldBack
+          ? []
+          : [{ kind: 'text' as const, content: STREAM_LOST_NOTICE, streaming: false }]),
         ...answerBlocks(input.state),
       ],
       reasoning: { content: '', active: false },

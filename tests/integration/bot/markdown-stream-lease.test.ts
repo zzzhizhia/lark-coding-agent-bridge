@@ -78,31 +78,31 @@ describe('markdown progress stream lease', () => {
     expect(channel.sent).toHaveLength(0);
   });
 
-  it('ignores an adapter whose final text repeats the prompt it was given', async () => {
-    // pi reports the user's prompt over its own event stream. A bridge that
-    // trusted `final_text` verbatim would read "system prompt + answer" as the
-    // answer, never find it on the card, and post the prompt back at the user.
+  it('sends a held-back answer as its own message, not as the card tail', async () => {
+    // Adapters report the turn's final message as `final_text` instead of
+    // streaming it, so the card holds the process and the answer arrives on its
+    // own message — it does not trail the card.
     vi.stubEnv('LARK_CHANNEL_STREAM_LEASE_MS', '600');
     vi.stubEnv('LARK_CHANNEL_STREAM_ROTATE_MS', '300');
     const { cards, stream } = recordingStream();
     const channel = (await startTestBridge(
       new PacedAgent([
-        { type: 'text', delta: 'ANSWER_SENTINEL' },
-        {
-          type: 'final_text',
-          content: 'BRIDGE_SYSTEM_PROMPT\n\n<user_input>run</user_input>\n\nANSWER_SENTINEL',
-        },
+        { type: 'text', delta: 'let me check something' },
+        { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        { type: 'tool_result', id: 't1', output: 'ok', isError: false },
+        { type: 'final_text', content: 'ANSWER_SENTINEL' },
         { type: 'done', terminationReason: 'normal' },
       ]),
       stream,
     ));
 
-    await channel.handlers.message?.(message('om_prompt_echo', 'run'));
+    await channel.handlers.message?.(message('om_held_back', 'run'));
 
-    await waitFor(() => lastText(cards).includes('ANSWER_SENTINEL'));
-    await settle();
-    expect(cards).toHaveLength(1);
-    expect(channel.sent).toHaveLength(0);
+    await waitFor(() => channel.sent.length === 1);
+    expect(lastMarkdown(channel)).toContain('ANSWER_SENTINEL');
+    // The card is the process view: the answer is not in it.
+    expect(lastText(cards)).toContain('let me check something');
+    expect(lastText(cards)).not.toContain('ANSWER_SENTINEL');
   });
 
   it('posts the answer on its own when Feishu dropped it', async () => {
